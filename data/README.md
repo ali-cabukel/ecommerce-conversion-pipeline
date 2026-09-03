@@ -30,3 +30,16 @@ Raw data is tracked with DVC (not committed to git). After download:
 ```bash
 dvc add data/raw
 ```
+
+## Training table
+
+`python training/dataset.py` reads the CSVs above and writes:
+
+- `data/processed/sessions.parquet` — one row per reconstructed session
+- `data/processed/sessions_meta.json` — row counts, conversion rate, source (`olist` or `synthetic`)
+
+If the Olist dump is missing, the builder synthesizes Olist-shaped tables so training still runs.
+
+**Label:** `purchased_within_session`
+
+**Features:** `user_total_orders`, `user_avg_order_value`, `product_conversion_rate_7d`, `product_view_count_7d`, `seller_avg_review_score`, `session_page_views`, `session_cart_value`, `minutes_since_last_event`, `checkout_started`
