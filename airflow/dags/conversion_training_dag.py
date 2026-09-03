@@ -18,7 +18,9 @@ PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/opt/airflow/project"))
 FEAST_REPO = PROJECT_ROOT / "feast" / "feature_repo"
 DBT_DIR = PROJECT_ROOT / "dbt"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics.json"
+DRIFT_METRICS_PATH = PROJECT_ROOT / "models" / "drift_metrics.json"
 MIN_TEST_ROC_AUC = float(os.environ.get("CONVERSION_MIN_TEST_ROC_AUC", "0.65"))
+FAIL_ON_DRIFT = os.environ.get("CONVERSION_FAIL_ON_DRIFT", "").lower() in {"1", "true", "yes"}
 
 
 def _runtime_feast_yaml() -> Path:
@@ -110,6 +112,20 @@ with DAG(
         return str(METRICS_PATH)
 
     @task
+    def detect_data_drift() -> dict:
+        """Compare latest warehouse features to the last training reference (Evidently PSI)."""
+        cmd = ["python", str(PROJECT_ROOT / "monitoring" / "drift.py"), "--from-warehouse"]
+        max_sessions = os.environ.get("DRIFT_CURRENT_SESSIONS") or os.environ.get("TRAIN_MAX_SESSIONS")
+        if max_sessions:
+            cmd.extend(["--max-sessions", max_sessions])
+        if FAIL_ON_DRIFT:
+            cmd.append("--fail-on-drift")
+        _run(cmd)
+        if not DRIFT_METRICS_PATH.exists():
+            raise AirflowException(f"Drift check finished without writing {DRIFT_METRICS_PATH}")
+        return json.loads(DRIFT_METRICS_PATH.read_text())
+
+    @task
     def validate_model(metrics_path: str) -> dict:
         """Fail the run if holdout ROC-AUC is below the promotion gate."""
         path = Path(metrics_path)
@@ -133,5 +149,6 @@ with DAG(
 
     dbt = run_dbt()
     feast = materialize_feast_features()
+    drifted = detect_data_drift()
     trained = train_conversion_model()
-    dbt >> feast >> trained >> validate_model(trained)
+    dbt >> feast >> drifted >> trained >> validate_model(trained)

@@ -22,7 +22,11 @@ x-airflow-common: &airflow-common
     REDIS_HOST: redis
     REDIS_PORT: "6379"
     CONVERSION_MIN_TEST_ROC_AUC: ${CONVERSION_MIN_TEST_ROC_AUC:-0.65}
+    CONVERSION_MAX_DRIFT_SHARE: ${CONVERSION_MAX_DRIFT_SHARE:-0.5}
+    CONVERSION_FAIL_ON_DRIFT: ${CONVERSION_FAIL_ON_DRIFT:-false}
+    CONVERSION_DRIFT_METHOD: ${CONVERSION_DRIFT_METHOD:-psi}
     TRAIN_MAX_SESSIONS: ${TRAIN_MAX_SESSIONS:-}
+    DRIFT_CURRENT_SESSIONS: ${DRIFT_CURRENT_SESSIONS:-}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs

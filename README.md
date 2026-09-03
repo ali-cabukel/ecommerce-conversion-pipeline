@@ -21,11 +21,12 @@ When a shopper views a product, adds to cart, or reaches checkout:
 |-------|------|------|
 | Ingestion | Kafka (Redpanda) | `page_view`, `add_to_cart`, `checkout_start`, `purchase` |
 | Warehouse | Postgres + dbt | Raw Olist/sessions → staging → feature marts |
-| Orchestration | Airflow | Daily DAG: dbt → Feast materialize → train → validate |
+| Orchestration | Airflow | Daily DAG: dbt → Feast → drift → train → validate |
 | Features | Feast + Redis | Postgres offline + Redis online |
 | Training | scikit-learn + MLflow | HistGradientBoosting → `models/` + `mlruns/` |
 | Serving | BentoML | `/predict` from Feast online features + joblib model |
 | Observability | Prometheus + Grafana | `/predict` request and response metrics |
+| Data drift | Evidently | PSI vs last training reference (`models/drift_*`) |
 
 ## Architecture
 
@@ -50,6 +51,7 @@ flowchart LR
   subgraph obs
     PROM[Prometheus]
     GRAF[Grafana]
+    EV[Evidently drift]
   end
 
   R --> K
@@ -57,6 +59,8 @@ flowchart LR
   AF --> DBT
   WH --> DBT --> FS
   AF --> FS
+  AF --> EV
+  FS --> EV
   FS --> RD
   RD --> BENTO
   BENTO --> PROM --> GRAF
@@ -204,6 +208,22 @@ Bind BentoML with `--host 0.0.0.0`. `127.0.0.1` is not reachable from Docker Des
 
 Dashboard panels: request rate, error rate, in-flight, latency p50/p95/p99, requests by status and source, error types, probability, `will_purchase`, request totals.
 
+## Data drift
+
+[Evidently](https://docs.evidentlyai.com/) (PSI) compares **current** session features to a **reference** snapshot written at train time (`models/drift_reference.parquet`). Great Expectations is a better fit for schema checks; Evidently is the library for distribution shift.
+
+```bash
+# After a model exists: latest warehouse vs last training snapshot
+uv run python monitoring/drift.py --from-warehouse
+
+# No snapshot yet: older sessions vs the most recent 20% (time split)
+uv run python monitoring/drift.py --from-warehouse --time-split
+# or from parquet:
+uv run python monitoring/drift.py --time-split
+```
+
+Writes `models/drift_metrics.json` and an HTML report `models/drift_report.html`. Dataset drift is true when the share of drifted columns ≥ `CONVERSION_MAX_DRIFT_SHARE` (default **0.5**). `--fail-on-drift` (or `CONVERSION_FAIL_ON_DRIFT=true`) exits non-zero so Airflow can block training.
+
 ## Local UIs
 
 | UI | URL | Start |
@@ -229,7 +249,7 @@ MLflow 3.x treats the file store as legacy, so `MLFLOW_ALLOW_FILE_STORE=true` is
 
 ## Airflow
 
-DAG `conversion_batch_training` (`@daily`): dbt → `feast apply` + materialize → `training/train.py` → fail if `test_roc_auc` &lt; `CONVERSION_MIN_TEST_ROC_AUC` (default **0.65**).
+DAG `conversion_batch_training` (`@daily`): dbt → `feast apply` + materialize → **Evidently drift** → `training/train.py` → fail if `test_roc_auc` &lt; `CONVERSION_MIN_TEST_ROC_AUC` (default **0.65**). Drift fails the DAG only when `CONVERSION_FAIL_ON_DRIFT=true`. Rebuild the Airflow image after adding `evidently` (`docker compose up -d --build airflow-scheduler airflow-webserver`).
 
 Paused on first load. Unpause after the warehouse has been loaded once. Custom image: `infra/airflow/Dockerfile`. Project mount: `/opt/airflow/project`. Inside the containers Feast uses a runtime yaml so hosts are `postgres` / `redis`, not `localhost`.
 
@@ -237,6 +257,9 @@ Paused on first load. Unpause after the warehouse has been loaded once. Custom i
 |----------|---------|
 | `TRAIN_MAX_SESSIONS` | Limit DAG training rows (empty = full table) |
 | `CONVERSION_MIN_TEST_ROC_AUC` | Promotion gate |
+| `CONVERSION_MAX_DRIFT_SHARE` | Dataset-drift threshold (default 0.5) |
+| `CONVERSION_FAIL_ON_DRIFT` | If true, drift task fails the DAG |
+| `DRIFT_CURRENT_SESSIONS` | Limit rows for the drift current window |
 | `AIRFLOW_WEBSERVER_PORT` | If 8080 is taken |
 | `BENTOML_PORT` | Serve + `publish_session` + Prometheus scrape (default 3000) |
 | `REDIS_PUBLISH_PORT` | Host publish for compose Redis if 6379 is taken |
@@ -249,7 +272,7 @@ Paused on first load. Unpause after the warehouse has been loaded once. Custom i
 uv run pytest
 ```
 
-Covers training, serving (including Prometheus `observe_request`), Feast definitions, and the session aggregator. No Redis or BentoML required.
+Covers training, serving (including Prometheus `observe_request`), Feast definitions, the session aggregator, and Evidently drift. No Redis or BentoML required.
 
 ## Pre-commit
 
@@ -285,6 +308,7 @@ Config: `.pre-commit-config.yaml`, `.sqlfluff`, `.gitleaks.toml`, `[tool.isort]`
 │   ├── publish_session.py      # One session → Kafka → /predict
 │   └── consumer/session_features.py
 ├── training/                   # Sessions + HistGradientBoosting
+├── monitoring/drift.py         # Evidently PSI vs training reference
 ├── serving/                    # BentoML ConversionService + Prometheus metrics
 ├── tests/
 └── observability/
