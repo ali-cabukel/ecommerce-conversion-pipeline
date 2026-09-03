@@ -94,14 +94,18 @@ flowchart LR
 ├── streaming/
 │   ├── replay/              # Replay Olist orders as Kafka events
 │   └── consumer/            # Stream processor → Redis online features
-├── training/                # Model training scripts (invoked by Airflow)
+├── training/                # Dataset builder + baseline model (MLflow)
+│   ├── dataset.py           # Olist orders → session table
+│   └── train.py             # HistGradientBoosting + metrics
 ├── serving/                 # BentoML service and model packaging
 └── observability/
     ├── prometheus/          # Scrape config
     └── grafana/             # Dashboards
 ```
 
-## Features (planned)
+## Features
+
+Training uses the same columns the online path will look up later. User, seller, and 7-day product stats are point-in-time (no future leakage).
 
 **Batch (dbt → Feast offline store)**
 
@@ -114,10 +118,12 @@ flowchart LR
 - `session_page_views`, `session_cart_value`
 - `minutes_since_last_event`, `checkout_started`
 
+Olist is order-level, not clickstream. `training/dataset.py` turns completed orders into converting sessions and reconstructs abandoned sessions from the same customers, products, and prices so both classes are present. Funnel snapshots (browse / cart / checkout) are sampled so the model can score a live session at any stage.
+
 ## Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/)
 - [Kaggle CLI](https://github.com/Kaggle/kaggle-api) (to download Olist data)
 - Optional: `dvc`, `dbt-core`, `feast`, `bentoml` (installed via project tooling later)
 
@@ -144,8 +150,9 @@ cd dbt && dbt run
 # 6. Register and materialize Feast features
 cd feast && feast apply
 
-# 7. Train via Airflow DAG or locally
-dvc repro
+# 7. Build the session table and train a baseline (MLflow + models/)
+uv sync
+python training/dataset.py
 python training/train.py
 
 # 8. Serve model
@@ -162,7 +169,7 @@ bentoml serve serving/service.py
 | 4 | `feast/` — feature views, offline/online stores |
 | 5 | `airflow/` — wire `conversion_batch_training` DAG tasks |
 | 6 | `streaming/` — event replay + Redis writer |
-| 7 | `training/` — baseline model + MLflow (called from Airflow) |
+| 7 | `training/` — baseline HistGradientBoosting + MLflow (called from Airflow) |
 | 8 | `serving/` — BentoML API |
 | 9 | `observability/` — dashboards and alerts |
 

@@ -223,8 +223,11 @@ airflow/logs/
 # ML pipeline
 data/raw/*.csv
 data/raw/*.zip
-data/processed/
+data/processed/*
+!data/processed/.gitkeep
 mlruns/
+mlartifacts/
+mlflow.db
 .dvc/cache
 .dvc/tmp
 models/*

@@ -5,13 +5,23 @@
 
 stages:
   ingest:
-    cmd: echo "Download Olist data into data/raw/ — see data/README.md"
+    cmd: python training/dataset.py
+    deps:
+      - training/dataset.py
+      - training/config.py
+      - data/raw
     outs:
-      - data/raw/.gitkeep
+      - data/processed/sessions.parquet
+      - data/processed/sessions_meta.json
 
   train:
     cmd: python training/train.py
     deps:
       - training/train.py
+      - training/dataset.py
+      - training/config.py
+      - data/processed/sessions.parquet
     outs:
-      - models/.gitkeep
+      - models/conversion_model.joblib
+      - models/metrics.json
+      - models/feature_names.json
