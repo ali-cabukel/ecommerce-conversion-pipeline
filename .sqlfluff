@@ -1,0 +1,39 @@
+[sqlfluff]
+dialect = postgres
+templater = jinja
+max_line_length = 100
+processes = 4
+exclude_rules = AL05, AM04, ST06, ST07
+
+[sqlfluff:templater:jinja]
+apply_dbt_builtins = true
+
+[sqlfluff:indentation]
+tab_space_size = 4
+indented_joins = false
+indented_ctes = false
+indented_using_on = true
+
+[sqlfluff:layout:type:comma]
+line_position = trailing
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.expression]
+prefer_count_1 = true

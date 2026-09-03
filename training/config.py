@@ -11,6 +11,7 @@ MODEL_DIR = PROJECT_ROOT / "models"
 MODEL_PATH = MODEL_DIR / "conversion_model.joblib"
 METRICS_PATH = MODEL_DIR / "metrics.json"
 FEATURE_NAMES_PATH = MODEL_DIR / "feature_names.json"
+FEAST_REPO_PATH = PROJECT_ROOT / "feast" / "feature_repo"
 
 EXPERIMENT_NAME = "conversion-prediction"
 LABEL_COL = "purchased_within_session"
@@ -27,6 +28,18 @@ FEATURE_COLUMNS = [
     "session_cart_value",
     "minutes_since_last_event",
     "checkout_started",
+]
+
+FEATURE_REFS = [
+    "user_features:user_total_orders",
+    "user_features:user_avg_order_value",
+    "product_features:product_conversion_rate_7d",
+    "product_features:product_view_count_7d",
+    "seller_features:seller_avg_review_score",
+    "session_features:session_page_views",
+    "session_features:session_cart_value",
+    "session_features:minutes_since_last_event",
+    "session_features:checkout_started",
 ]
 
 ID_COLUMNS = [

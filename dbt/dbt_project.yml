@@ -18,7 +18,9 @@ clean-targets:
 models:
   ecommerce_conversion:
     staging:
+      +schema: staging
       +materialized: view
     marts:
       features:
+        +schema: marts
         +materialized: table

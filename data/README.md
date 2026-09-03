@@ -40,6 +40,13 @@ dvc add data/raw
 
 If the Olist dump is missing, the builder synthesizes Olist-shaped tables so training still runs.
 
+Load into Postgres for dbt / Feast:
+
+```bash
+python warehouse/load_raw.py   # raw.olist_* + raw.sessions
+cd dbt && dbt run --profiles-dir .
+```
+
 **Label:** `purchased_within_session`
 
 **Features:** `user_total_orders`, `user_avg_order_value`, `product_conversion_rate_7d`, `product_view_count_7d`, `seller_avg_review_score`, `session_page_views`, `session_cart_value`, `minutes_since_last_event`, `checkout_started`

@@ -1,0 +1,17 @@
+.git
+.venv
+airflow/logs
+data/raw
+data/processed
+dbt/target
+dbt/logs
+dbt/dbt_packages
+feast/feature_repo/data
+mlruns
+mlartifacts
+models/*.joblib
+models/*.json
+models/*.csv
+**/.pytest_cache
+**/__pycache__
+**/*.pyc

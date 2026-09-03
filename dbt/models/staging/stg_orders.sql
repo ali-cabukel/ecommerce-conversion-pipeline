@@ -1,8 +1,7 @@
--- Staging model placeholder: raw Olist orders loaded into warehouse.
--- Implement after raw tables are loaded from data/raw CSVs.
-
 select
-    cast(null as text) as order_id,
-    cast(null as text) as customer_id,
-    cast(null as timestamp) as order_purchase_timestamp
-where false
+    order_id::text as order_id,
+    customer_id::text as customer_id,
+    order_status::text as order_status,
+    order_purchase_timestamp::timestamptz as order_purchase_timestamp
+from {{ source("raw", "olist_orders") }}
+where order_purchase_timestamp is not null

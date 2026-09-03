@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    tables:
+      - name: olist_orders
+      - name: olist_order_items
+      - name: olist_customers
+      - name: olist_order_reviews
+      - name: sessions

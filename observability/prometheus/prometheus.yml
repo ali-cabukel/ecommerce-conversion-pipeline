@@ -1,9 +1,18 @@
 global:
-  scrape_interval: 15s
+  scrape_interval: 5s
+  evaluation_interval: 5s
 
 scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
 
-  # Add bentoml, kafka-exporter, redis-exporter targets in phase 8
+  # BentoML on the host. Bind with --host 0.0.0.0 so Docker Desktop can scrape.
+  - job_name: bentoml
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:__BENTOML_PORT__"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: serving
