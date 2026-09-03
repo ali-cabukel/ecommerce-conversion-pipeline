@@ -1,0 +1,12 @@
+title = "ecommerce-conversion-pipeline"
+
+[extend]
+useDefault = true
+
+# Documented local demo placeholders only. Real secrets must still fail the hook.
+[allowlist]
+description = "Local demo credentials from README / .env.example"
+regexes = [
+    '''changethis''',
+    '''46BKJoQYlFDeTCdn1UdMwTx1EGnLaeDE5aDm9Yfg98=''',
+]

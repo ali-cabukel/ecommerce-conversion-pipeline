@@ -1,6 +1,8 @@
-# Phase 1 scaffold — services will be wired in subsequent PRs.
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.10.4-python3.11
+  build:
+    context: .
+    dockerfile: infra/airflow/Dockerfile
+  image: ecommerce-conversion-airflow:2.10.4
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
@@ -9,12 +11,18 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
-    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+    PROJECT_ROOT: /opt/airflow/project
+    PYTHONPATH: /opt/airflow/project
+    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-file:///opt/airflow/project/mlruns}
     POSTGRES_HOST: postgres
-    POSTGRES_PORT: 5432
+    POSTGRES_PORT: "5432"
     POSTGRES_USER: ${POSTGRES_USER:-conversion}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changethis}
     POSTGRES_DB: ${POSTGRES_DB:-conversion}
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    CONVERSION_MIN_TEST_ROC_AUC: ${CONVERSION_MIN_TEST_ROC_AUC:-0.65}
+    TRAIN_MAX_SESSIONS: ${TRAIN_MAX_SESSIONS:-}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -23,6 +31,8 @@ x-airflow-common: &airflow-common
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
+      condition: service_healthy
+    redis:
       condition: service_healthy
 
 services:
@@ -46,11 +56,38 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_PUBLISH_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
+      retries: 10
+
+  kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://kafka:9092,external://localhost:19092
+      - --rpc-addr
+      - kafka:33145
+      - --advertise-rpc-addr
+      - kafka:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --default-log-level
+      - warn
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 10
 
   airflow-init:
@@ -60,6 +97,29 @@ services:
       - -c
       - |
         mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        python - <<'PY'
+        import os
+        import psycopg2
+        from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
+        conn = psycopg2.connect(
+            host=os.environ["POSTGRES_HOST"],
+            port=os.environ.get("POSTGRES_PORT", "5432"),
+            user=os.environ["POSTGRES_USER"],
+            password=os.environ["POSTGRES_PASSWORD"],
+            dbname=os.environ["POSTGRES_DB"],
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'airflow'")
+        if cur.fetchone() is None:
+            cur.execute("CREATE USER airflow WITH PASSWORD 'airflow'")
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'airflow'")
+        if cur.fetchone() is None:
+            cur.execute("CREATE DATABASE airflow OWNER airflow")
+        cur.close()
+        conn.close()
+        PY
         airflow db migrate
         airflow users create \
           --username "$${AIRFLOW_ADMIN_USERNAME}" \
@@ -87,6 +147,10 @@ services:
       retries: 5
     restart: always
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
 
@@ -100,8 +164,50 @@ services:
       retries: 5
     restart: always
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    environment:
+      BENTOML_PORT: ${BENTOML_PORT:-3000}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sed "s/__BENTOML_PORT__/$${BENTOML_PORT}/g" /etc/prometheus/prometheus.yml > /tmp/prometheus.yml
+        exec /bin/prometheus \
+          --config.file=/tmp/prometheus.yml \
+          --storage.tsdb.retention.time=7d \
+          --web.enable-lifecycle
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/serving.json
+    ports:
+      - "${GRAFANA_PORT:-3002}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   postgres-data:
+  prometheus-data:
+  grafana-data:

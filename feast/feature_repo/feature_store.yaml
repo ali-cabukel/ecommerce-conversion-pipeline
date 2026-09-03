@@ -1,7 +1,7 @@
 project: ecommerce_conversion
-registry: local
+registry: data/registry.db
 provider: local
-entity_key_serialization_version: 2
+entity_key_serialization_version: 3
 
 offline_store:
   type: postgres
@@ -11,7 +11,9 @@ offline_store:
   db_schema: feast
   user: conversion
   password: changethis
+  sslmode: disable
 
 online_store:
   type: redis
+  redis_type: redis
   connection_string: "localhost:6379"

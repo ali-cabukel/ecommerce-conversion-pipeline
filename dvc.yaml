@@ -1,7 +1,7 @@
 # DVC pipeline — stages will be implemented incrementally.
 #
 # Planned flow (orchestrated by Airflow DAG conversion_batch_training):
-#   ingest → dbt_features → feast_materialize → train → export_bentoml
+#   ingest → load_warehouse → dbt_features → feast_materialize → train → export_bentoml
 
 stages:
   ingest:
@@ -14,13 +14,32 @@ stages:
       - data/processed/sessions.parquet
       - data/processed/sessions_meta.json
 
+  load_warehouse:
+    cmd: python warehouse/load_raw.py
+    deps:
+      - warehouse/load_raw.py
+      - data/processed/sessions.parquet
+      - data/raw
+
+  dbt_features:
+    cmd: dbt run --project-dir dbt --profiles-dir dbt
+    deps:
+      - dbt/models
+      - dbt/dbt_project.yml
+
+  feast_apply:
+    wdir: feast/feature_repo
+    cmd: feast apply
+    deps:
+      - feast/feature_repo/features.py
+      - feast/feature_repo/feature_store.yaml
+
   train:
     cmd: python training/train.py
     deps:
       - training/train.py
-      - training/dataset.py
       - training/config.py
-      - data/processed/sessions.parquet
+      - feast/feature_repo/features.py
     outs:
       - models/conversion_model.joblib
       - models/metrics.json

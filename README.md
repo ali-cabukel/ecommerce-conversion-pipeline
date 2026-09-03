@@ -2,39 +2,37 @@
 
 Real-time e-commerce conversion prediction demo: score the likelihood a shopper completes a purchase during an active session.
 
-Built on the [Olist Brazilian E-Commerce](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) dataset, replayed as a live event stream for demos and portfolio use.
+Built on the [Olist Brazilian E-Commerce](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) dataset, replayed as a live event stream.
 
 ## Use case
 
-When a user views a product, adds to cart, or reaches checkout, the pipeline:
+When a shopper views a product, adds to cart, or reaches checkout:
 
-1. Ingests behavioral events through **Kafka**
-2. Updates session features in **Redis** (online store)
-3. Joins batch features from the warehouse via **Feast**
-4. Serves a conversion probability from **BentoML**
-5. Exposes latency, throughput, and business KPIs in **Grafana**
+1. Kafka ingests the event
+2. A consumer writes **session** features to Redis through Feast `push`
+3. BentoML joins those with **user / product / seller** features already materialized from the warehouse
+4. `/predict` returns `conversion_probability`
 
-**Label:** `purchased_within_session` (derived from order timestamps during replay).
+**Label:** `purchased_within_session`.
 
 ## Stack
 
 | Layer | Tool | Role |
 |-------|------|------|
-| Ingestion | Kafka | `page_view`, `add_to_cart`, `checkout_start`, `purchase` events |
-| Transform | dbt | Warehouse models → user/product/session feature tables |
-| Orchestration | Airflow | Scheduled batch pipeline: dbt → Feast materialize → train |
-| Versioning | DVC | Dataset snapshots and reproducible pipeline stages |
-| Features | Feast + Redis | Offline store (warehouse) + online store (low-latency lookup) |
-| Training | MLflow | Experiment tracking, model registry |
-| Serving | BentoML | Real-time `/predict` API |
-| Observability | Prometheus + Grafana | Pipeline health, inference latency, conversion metrics |
+| Ingestion | Kafka (Redpanda) | `page_view`, `add_to_cart`, `checkout_start`, `purchase` |
+| Warehouse | Postgres + dbt | Raw Olist/sessions → staging → feature marts |
+| Orchestration | Airflow | Daily DAG: dbt → Feast materialize → train → validate |
+| Features | Feast + Redis | Postgres offline + Redis online |
+| Training | scikit-learn + MLflow | HistGradientBoosting → `models/` + `mlruns/` |
+| Serving | BentoML | `/predict` from Feast online features + joblib model |
+| Observability | Prometheus + Grafana | `/predict` request and response metrics |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   subgraph ingest
-    R[Event replay]
+    R[publish_session / replay]
     K[Kafka]
   end
   subgraph batch
@@ -46,10 +44,8 @@ flowchart LR
     FS[Feast]
     RD[(Redis)]
   end
-  subgraph ml
-    DVC[DVC]
-    MLF[MLflow]
-    BENTO[BentoML]
+  subgraph serve
+    BENTO[BentoML /predict]
   end
   subgraph obs
     PROM[Prometheus]
@@ -57,121 +53,244 @@ flowchart LR
   end
 
   R --> K
-  K --> WH
+  K --> FS
   AF --> DBT
   WH --> DBT --> FS
   AF --> FS
-  K --> RD
   FS --> RD
-  DVC --> MLF
-  AF --> MLF
-  FS --> MLF --> BENTO
+  RD --> BENTO
   BENTO --> PROM --> GRAF
-  K --> PROM
 ```
 
-**Two paths:**
+**Two paths into Redis**
 
-- **Real-time** — Kafka → Redis session features → BentoML inference
-- **Batch** — Airflow DAG (`conversion_batch_training`) runs dbt, Feast materialization, and MLflow training on a schedule (daily)
+- **Batch** — dbt marts → Feast offline (Postgres) → `feast materialize` → user / product / seller (+ optional session snapshot)
+- **Live** — Kafka `ecommerce.events` → `session_features` consumer → Feast `push` → session row overwritten in Redis
 
-## Repository layout
-
-```
-.
-├── compose.yml              # Local infra (Postgres, Redis, Airflow, …)
-├── dvc.yaml                 # DVC pipeline definition
-├── airflow/
-│   ├── dags/                # Batch training DAGs
-│   ├── logs/
-│   └── plugins/
-├── data/
-│   └── raw/                 # Olist CSVs (not committed; see data/README.md)
-├── dbt/                     # Warehouse transforms and feature tables
-├── feast/                   # Feast feature definitions and materialization
-├── infra/
-│   └── postgres/init/       # Airflow metadata DB bootstrap
-├── streaming/
-│   ├── replay/              # Replay Olist orders as Kafka events
-│   └── consumer/            # Stream processor → Redis online features
-├── training/                # Dataset builder + baseline model (MLflow)
-│   ├── dataset.py           # Olist orders → session table
-│   └── train.py             # HistGradientBoosting + metrics
-├── serving/                 # BentoML service and model packaging
-└── observability/
-    ├── prometheus/          # Scrape config
-    └── grafana/             # Dashboards
-```
+Training reads Feast historical features from Postgres (`staging.stg_sessions` spine). `--from-parquet` is a fallback only.
 
 ## Features
 
-Training uses the same columns the online path will look up later. User, seller, and 7-day product stats are point-in-time (no future leakage).
+Same columns online and offline. User, seller, and 7-day product stats are point-in-time (no future leakage).
 
-**Batch (dbt → Feast offline store)**
+| Source | Features |
+|--------|----------|
+| Olist orders (batch) | `user_total_orders`, `user_avg_order_value` |
+| Olist reviews (batch) | `seller_avg_review_score` |
+| Reconstructed sessions (batch) | `product_conversion_rate_7d`, `product_view_count_7d` |
+| Kafka (live) | `session_page_views`, `session_cart_value`, `minutes_since_last_event`, `checkout_started` |
 
-- `user_total_orders`, `user_avg_order_value`
-- `product_conversion_rate_7d`, `product_view_count_7d`
-- `seller_avg_review_score`
-
-**Real-time (Kafka → Redis via Feast online store)**
-
-- `session_page_views`, `session_cart_value`
-- `minutes_since_last_event`, `checkout_started`
-
-Olist is order-level, not clickstream. `training/dataset.py` turns completed orders into converting sessions and reconstructs abandoned sessions from the same customers, products, and prices so both classes are present. Funnel snapshots (browse / cart / checkout) are sampled so the model can score a live session at any stage.
+Olist is order-level, not clickstream. `training/dataset.py` turns completed orders into converting sessions and reconstructs abandoned ones so both classes exist. Funnel snapshots (browse / cart / checkout) are sampled so a live session can be scored at any stage.
 
 ## Prerequisites
 
 - Docker and Docker Compose
 - Python 3.11+ and [uv](https://docs.astral.sh/uv/)
-- [Kaggle CLI](https://github.com/Kaggle/kaggle-api) (to download Olist data)
-- Optional: `dvc`, `dbt-core`, `feast`, `bentoml` (installed via project tooling later)
+- [Kaggle CLI](https://github.com/Kaggle/kaggle-api) for Olist (`data/README.md`)
 
-## Quick start
+Default warehouse: user `conversion`, password `changethis`, database `conversion`, `localhost:5432`. Always use `uv run feast …` (a conda `feast` on `PATH` often lacks `psycopg`).
+
+## 1. One-time setup
 
 ```bash
-# 1. Clone and configure
 cp .env.example .env
-# Linux/macOS: ensure Airflow can write logs
 mkdir -p airflow/logs && echo -e "AIRFLOW_UID=$(id -u)" >> .env
+# Download Olist into data/raw/  — see data/README.md
 
-# 2. Download Olist dataset into data/raw/
-#    See data/README.md
+docker compose up -d --build postgres redis kafka prometheus grafana \
+  airflow-init airflow-webserver airflow-scheduler
 
-# 3. Start infrastructure
-docker compose up -d
-
-# 4. Open Airflow UI → http://localhost:8080 (admin / admin)
-#    Unpause DAG: conversion_batch_training
-
-# 5. Build warehouse features (manual until DAG tasks are implemented)
-cd dbt && dbt run
-
-# 6. Register and materialize Feast features
-cd feast && feast apply
-
-# 7. Build the session table and train a baseline (MLflow + models/)
 uv sync
-python training/dataset.py
-python training/train.py
+uv run pre-commit install
+uv run python training/dataset.py
+uv run python warehouse/load_raw.py
+cd dbt && uv run dbt run --profiles-dir . && cd ..
 
-# 8. Serve model
-bentoml serve serving/service.py
+cd feast/feature_repo
+uv run feast apply
+uv run feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)
+cd ../..
+
+uv run python training/train.py
+# optional: uv run python training/train.py --max-sessions 4000
 ```
 
-## Build order
+If host port **6379** is taken, set `REDIS_PUBLISH_PORT=6380`. Feast on the host still expects Redis at `localhost:6379` (your existing Redis, or map 6379). If **8080** is taken, set `AIRFLOW_WEBSERVER_PORT` (this machine often uses **8081**). If **3000** is taken (common for Node), set `BENTOML_PORT=3003` in `.env` and use that port for serve, publish, and Prometheus.
 
-| Phase | Work |
-|-------|------|
-| 1 | `compose.yml` — Postgres, Redis, Airflow, Kafka, MLflow, Prometheus, Grafana |
-| 2 | `data/` + DVC — pin Olist snapshot |
-| 3 | `dbt/` — staging + feature mart models |
-| 4 | `feast/` — feature views, offline/online stores |
-| 5 | `airflow/` — wire `conversion_batch_training` DAG tasks |
-| 6 | `streaming/` — event replay + Redis writer |
-| 7 | `training/` — baseline HistGradientBoosting + MLflow (called from Airflow) |
-| 8 | `serving/` — BentoML API |
-| 9 | `observability/` — dashboards and alerts |
+## 2. End-to-end score (Kafka → Redis → BentoML → Grafana)
+
+Leave the consumer running **before** you publish, or it will miss the events (unless you start a new consumer group with `auto_offset_reset=earliest`). Use the same `BENTOML_PORT` everywhere.
+
+```bash
+# Terminal B — Kafka → Feast push → Redis
+uv run python streaming/consumer/session_features.py
+
+# Terminal C — model server (0.0.0.0 so Prometheus in Docker can scrape /metrics)
+uv run bentoml serve serving.service:ConversionService --host 0.0.0.0 --port "${BENTOML_PORT:-3000}"
+
+# Terminal D — Kafka events, then HTTP /predict (Grafana only records this step)
+uv run python streaming/publish_session.py
+```
+
+`publish_session.py` emits page_view / add_to_cart / checkout / purchase for the latest reconstructed session (`--session-id` to pick one), waits `--wait` seconds (default 2) for the consumer to push Redis, then POSTs `/predict` on `$BENTOML_PORT`. After the push, **`session_id` is enough** — BentoML reads customer / product / seller from Redis and joins materialized batch features.
+
+`--no-predict` publishes Kafka only (Grafana will stay flat). Manual score:
+
+```bash
+curl -s "http://localhost:${BENTOML_PORT:-3000}/predict" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<id printed by publish_session>"}'
+```
+
+To flood the topic instead of one session:
+
+```bash
+uv run python streaming/replay/replay_events.py --max-sessions 50
+```
+
+**Smoke test without Redis** (not the live path):
+
+```bash
+curl -s "http://localhost:${BENTOML_PORT:-3000}/predict" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id":"s-demo",
+    "features":{
+      "user_total_orders":2,
+      "user_avg_order_value":89.5,
+      "product_conversion_rate_7d":0.12,
+      "product_view_count_7d":40,
+      "seller_avg_review_score":4.2,
+      "session_page_views":5,
+      "session_cart_value":120.0,
+      "minutes_since_last_event":1.5,
+      "checkout_started":1
+    }
+  }'
+```
+
+BentoML docs: `http://localhost:$BENTOML_PORT`. Startup fails if `models/conversion_model.joblib` is missing.
+
+## Observability
+
+Grafana shows **serving API** traffic only. Kafka publish and Feast/Redis pushes do not appear on the dashboard.
+
+```bash
+docker compose up -d prometheus grafana
+# BentoML must already be on 0.0.0.0:$BENTOML_PORT
+# Generate points:  uv run python streaming/publish_session.py
+```
+
+| UI | URL | Login |
+|----|-----|--------|
+| Grafana | http://localhost:3002 | admin / admin — dashboard **Conversion serving API** |
+| Prometheus | http://localhost:9090 | target `bentoml` must be **UP** |
+
+Grafana is on **3002** so it does not collide with BentoML. If you change `BENTOML_PORT`, recreate Prometheus so the scrape target matches:
+
+```bash
+BENTOML_PORT=3003 docker compose up -d prometheus
+```
+
+Bind BentoML with `--host 0.0.0.0`. `127.0.0.1` is not reachable from Docker Desktop (`host.docker.internal`). Confirm scrape at http://localhost:9090/targets and raw series at `http://localhost:$BENTOML_PORT/metrics`.
+
+| Series | Kind | Labels / meaning |
+|--------|------|------------------|
+| `conversion_predict_requests_total` | counter | `status` (`ok`/`error`), `source` (`feast_online`/`override`), `error` (`none`/`invalid`/`not_found`/`store`/`other`) |
+| `conversion_predict_in_flight` | gauge | concurrent `/predict` calls |
+| `conversion_predict_latency_seconds` | histogram | request latency |
+| `conversion_predict_probability` | histogram | predicted score on successful responses |
+| `conversion_predict_will_purchase_total` | counter | predicted class (`true`/`false`) |
+
+Dashboard panels: request rate, error rate, in-flight, latency p50/p95/p99, requests by status and source, error types, probability, `will_purchase`, request totals.
+
+## Local UIs
+
+| UI | URL | Start |
+|----|-----|--------|
+| BentoML | http://localhost:3000 (`$BENTOML_PORT`) | step 2; `--host 0.0.0.0` |
+| Grafana | http://localhost:3002 | compose `prometheus` + `grafana` |
+| Prometheus | http://localhost:9090 | same; check **Status → Targets** |
+| Airflow | http://localhost:8080 (or `$AIRFLOW_WEBSERVER_PORT`) admin / admin | compose in step 1 |
+| Feast | http://localhost:8888 | below |
+| MLflow | http://localhost:5001 | below |
+
+```bash
+cd feast/feature_repo
+uv run --with grpcio --with grpcio-health-checking --with grpcio-reflection \
+  feast ui --host 127.0.0.1 --port 8888
+
+cd ../..
+MLFLOW_ALLOW_FILE_STORE=true uv run --with 'anyio==4.9.0' \
+  python -m mlflow ui --backend-store-uri ./mlruns --host 127.0.0.1 --port 5001
+```
+
+MLflow 3.x treats the file store as legacy, so `MLFLOW_ALLOW_FILE_STORE=true` is required. Port **5000** is often taken by macOS AirPlay.
+
+## Airflow
+
+DAG `conversion_batch_training` (`@daily`): dbt → `feast apply` + materialize → `training/train.py` → fail if `test_roc_auc` &lt; `CONVERSION_MIN_TEST_ROC_AUC` (default **0.65**).
+
+Paused on first load. Unpause after the warehouse has been loaded once. Custom image: `infra/airflow/Dockerfile`. Project mount: `/opt/airflow/project`. Inside the containers Feast uses a runtime yaml so hosts are `postgres` / `redis`, not `localhost`.
+
+| Variable | Purpose |
+|----------|---------|
+| `TRAIN_MAX_SESSIONS` | Limit DAG training rows (empty = full table) |
+| `CONVERSION_MIN_TEST_ROC_AUC` | Promotion gate |
+| `AIRFLOW_WEBSERVER_PORT` | If 8080 is taken |
+| `BENTOML_PORT` | Serve + `publish_session` + Prometheus scrape (default 3000) |
+| `REDIS_PUBLISH_PORT` | Host publish for compose Redis if 6379 is taken |
+
+`airflow-init` creates the `airflow` role/database if the Postgres volume predates that user.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+Covers training, serving (including Prometheus `observe_request`), Feast definitions, and the session aggregator. No Redis or BentoML required.
+
+## Pre-commit
+
+Hooks run on every `git commit`. Install once after `uv sync`:
+
+```bash
+uv run pre-commit install
+uv run pre-commit run --all-files
+```
+
+| Hook | What it checks |
+|------|----------------|
+| **isort** | Import order (`profile = black`, line length 100) |
+| **sqlfluff** | Lint + autofix Postgres / dbt SQL (jinja `ref` / `source`). Skips `dbt/macros/` |
+| **bandit** | Python security scan (skips `tests/`) |
+| **gitleaks** | Hardcoded secrets. Allowlists only the documented demo values `changethis` and the Airflow example Fernet key |
+
+Config: `.pre-commit-config.yaml`, `.sqlfluff`, `.gitleaks.toml`, `[tool.isort]` / `[tool.bandit]` in `pyproject.toml`.
+
+## Repository layout
+
+```
+.
+├── compose.yml                 # Postgres, Redis, Kafka, Airflow, Prometheus, Grafana
+├── .pre-commit-config.yaml     # isort, sqlfluff, bandit, gitleaks
+├── airflow/dags/               # conversion_batch_training
+├── warehouse/                  # Load Olist + sessions into raw
+├── dbt/                        # Staging + feature marts
+├── feast/feature_repo/         # Postgres offline, Redis online
+├── infra/airflow/              # Airflow image (dbt, Feast, sklearn)
+├── streaming/
+│   ├── replay/replay_events.py
+│   ├── publish_session.py      # One session → Kafka → /predict
+│   └── consumer/session_features.py
+├── training/                   # Sessions + HistGradientBoosting
+├── serving/                    # BentoML ConversionService + Prometheus metrics
+├── tests/
+└── observability/
+    ├── prometheus/prometheus.yml
+    └── grafana/                # Provisioned serving dashboard
+```
 
 ## Related repo
 

@@ -26,11 +26,14 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sqlalchemy import create_engine, text
 
 from training.config import (
     EXPERIMENT_NAME,
+    FEAST_REPO_PATH,
     FEATURE_COLUMNS,
     FEATURE_NAMES_PATH,
+    FEATURE_REFS,
     LABEL_COL,
     METRICS_PATH,
     MODEL_DIR,
@@ -41,6 +44,7 @@ from training.config import (
     TEST_FRACTION,
 )
 from training.dataset import build_training_table
+from warehouse.load_raw import warehouse_url
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +70,69 @@ def _load_or_build_sessions(
     )
 
 
+def load_entity_spine(max_sessions: int | None = None) -> pd.DataFrame:
+    """Session keys + label from the dbt warehouse (training spine)."""
+    engine = create_engine(warehouse_url())
+    query = """
+        SELECT
+            session_id,
+            customer_id,
+            product_id,
+            seller_id,
+            session_ts AS event_timestamp,
+            purchased_within_session
+        FROM staging.stg_sessions
+    """
+    params: dict[str, int] = {}
+    if max_sessions:
+        query += " ORDER BY session_ts DESC LIMIT :limit"
+        params["limit"] = int(max_sessions)
+    # pandas.read_sql(text()) fails on SQLAlchemy 1.4 (Airflow image). Execute via SQLAlchemy.
+    with engine.connect() as conn:
+        result = conn.execute(text(query), params)
+        spine = pd.DataFrame(result.fetchall(), columns=list(result.keys()))
+    spine["event_timestamp"] = pd.to_datetime(spine["event_timestamp"], utc=True)
+    return spine.sort_values("event_timestamp").reset_index(drop=True)
+
+
+def load_training_table_from_feast(
+    repo_path: Path = FEAST_REPO_PATH,
+    max_sessions: int | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Point-in-time features from Feast offline (Postgres marts)."""
+    from feast import FeatureStore
+
+    spine = load_entity_spine(max_sessions=max_sessions)
+    logger.info("Retrieving historical features for %s sessions from Feast", len(spine))
+    store = FeatureStore(repo_path=str(repo_path))
+    hist = store.get_historical_features(
+        entity_df=spine,
+        features=FEATURE_REFS,
+    ).to_df()
+    if "session_ts" not in hist.columns:
+        hist = hist.rename(columns={"event_timestamp": "session_ts"})
+    hist = hist.drop_duplicates(subset=["session_id"], keep="last")
+    missing = [col for col in FEATURE_COLUMNS + [LABEL_COL, "session_ts"] if col not in hist.columns]
+    if missing:
+        raise RuntimeError(f"Feast historical retrieval missing columns: {missing}")
+    hist = hist.sort_values("session_ts").reset_index(drop=True)
+    meta = {
+        "source": "feast_postgres",
+        "n_sessions": int(len(hist)),
+        "n_converters": int(hist[LABEL_COL].sum()),
+        "conversion_rate": float(hist[LABEL_COL].mean()),
+        "feature_columns": FEATURE_COLUMNS,
+        "label": LABEL_COL,
+        "feast_repo": str(repo_path),
+    }
+    return hist, meta
+
+
 def time_split(
     sessions: pd.DataFrame, test_fraction: float = TEST_FRACTION
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ordered = sessions.sort_values("session_ts").reset_index(drop=True)
+    time_col = "session_ts" if "session_ts" in sessions.columns else "event_timestamp"
+    ordered = sessions.sort_values(time_col).reset_index(drop=True)
     cut = int(len(ordered) * (1.0 - test_fraction))
     if cut <= 0 or cut >= len(ordered):
         raise ValueError("Not enough rows for a time-based train/test split")
@@ -203,23 +266,36 @@ def log_mlflow(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the conversion baseline")
+    parser.add_argument(
+        "--from-parquet",
+        action="store_true",
+        help="Use data/processed/sessions.parquet instead of Feast/Postgres",
+    )
     parser.add_argument("--processed", type=Path, default=PROCESSED_PATH)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DIR)
     parser.add_argument("--rebuild-data", action="store_true")
     parser.add_argument("--max-orders", type=int, default=None)
+    parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument("--repo", type=Path, default=FEAST_REPO_PATH)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--test-fraction", type=float, default=TEST_FRACTION)
     parser.add_argument("--skip-mlflow", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    sessions, meta = _load_or_build_sessions(
-        processed_path=args.processed,
-        raw_dir=args.raw_dir,
-        rebuild=args.rebuild_data,
-        seed=args.seed,
-        max_orders=args.max_orders,
-    )
+    if args.from_parquet:
+        sessions, meta = _load_or_build_sessions(
+            processed_path=args.processed,
+            raw_dir=args.raw_dir,
+            rebuild=args.rebuild_data,
+            seed=args.seed,
+            max_orders=args.max_orders,
+        )
+    else:
+        sessions, meta = load_training_table_from_feast(
+            repo_path=args.repo,
+            max_sessions=args.max_sessions,
+        )
     logger.info(
         "Training on %s sessions (conversion_rate=%.3f)",
         len(sessions),

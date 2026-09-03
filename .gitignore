@@ -228,6 +228,12 @@ data/processed/*
 mlruns/
 mlartifacts/
 mlflow.db
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+feast/feature_repo/data/
+feast/feature_repo/registry.db
 .dvc/cache
 .dvc/tmp
 models/*
