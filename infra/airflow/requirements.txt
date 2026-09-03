@@ -1,5 +1,6 @@
 # Extra packages the conversion DAG needs on top of the Airflow image.
 dbt-postgres>=1.8
+evidently>=0.7
 feast[postgres,redis]>=0.41
 joblib>=1.4
 mlflow>=2.16

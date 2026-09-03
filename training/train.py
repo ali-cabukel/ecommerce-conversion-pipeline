@@ -306,6 +306,9 @@ def main() -> None:
         sessions, seed=args.seed, test_fraction=args.test_fraction
     )
     persist(model, metrics, importance, meta)
+    from monitoring.drift import write_reference
+
+    write_reference(sessions)
 
     logger.info("test_roc_auc=%.4f  test_pr_auc=%.4f  test_brier=%.4f", metrics["test_roc_auc"], metrics["test_pr_auc"], metrics["test_brier"])
     logger.info("Top features:\n%s", importance.head(5).to_string(index=False))
